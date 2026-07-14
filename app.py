@@ -369,13 +369,8 @@ def stamp_median_mask(beat_positions, sample_rate, median_mask, target_len, anch
 @st.cache_resource
 def load_models():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1. Recupera la cartella in cui si trova fisicamente questo script (app.py)
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # 2. Costruisce il percorso assoluto corretto verso i file dei pesi .pt
-    model_v3_path = os.path.join(current_dir, 'best_fase2_v3.pt')
-    model_f6_path = os.path.join(current_dir, 'best_fase6.pt')
+    model_v3_path = 'best_fase2_v3.pt'
+    model_f6_path = 'best_fase6.pt'
     
     model_v3 = EnhancedUNetV3(in_channels=1, num_classes=4, f=12).to(device)
     model_v3.load_state_dict(torch.load(model_v3_path, map_location=device))
@@ -1028,33 +1023,33 @@ def main():
                     col_main.pyplot(fig_med, use_container_width=True)
                     
 
-            # Metriche globali battito medio
-            if median_sigs:
-                col_main.markdown(f"#### Metriche sul Battito Medio (Tolleranza {tol_ms}ms) - Media Ensemble")
-                lead_scores_v3, lead_scores_f6 = {}, {}
-                for l, sig in median_sigs.items():
-                    s3, s6 = run_inference(sig, is_cont=False)
-                    lead_scores_v3[l] = s3
-                    lead_scores_f6[l] = s6
-                    
-                sv3_avg = torch.stack(list(lead_scores_v3.values()), dim=0).mean(dim=0)
-                sf6_avg = torch.stack(list(lead_scores_f6.values()), dim=0).mean(dim=0)
-                mask_avg_pre = get_mask(sv3_avg, sf6_avg, MEDIAN_LEN)
-                mask_avg_post = postprocess_mask(mask_avg_pre, fs=TARGET_FS)
-                
-                gt_med_mask = build_median_gt_mask(global_ann_corrected, TARGET_FS)
-                masks_dict = {
-                    "Avg12 - Pre-PP (Fase 2)": mask_avg_pre,
-                    "Avg12 - Post-PP (Fase 6)": mask_avg_post,
-                }
-                
-                # Cerca derivazione II per metriche specifiche se disponibile
-                lead_ii_key = next((k for k in median_sigs.keys() if k.lower() == 'ii'), None)
-                if lead_ii_key:
-                    mask_ii_pre = get_mask(lead_scores_v3[lead_ii_key], lead_scores_f6[lead_ii_key], MEDIAN_LEN)
-                    masks_dict["Lead II - Post-PP"] = postprocess_mask(mask_ii_pre, fs=TARGET_FS)
-                    
-                render_metrics_tables(gt_med_mask, masks_dict, tol_ms, container=col_main)
+            # Metriche globali battito medio (COMMENTATE)
+            # if median_sigs:
+            #     col_main.markdown(f"#### Metriche sul Battito Medio (Tolleranza {tol_ms}ms) - Media Ensemble")
+            #     lead_scores_v3, lead_scores_f6 = {}, {}
+            #     for l, sig in median_sigs.items():
+            #         s3, s6 = run_inference(sig, is_cont=False)
+            #         lead_scores_v3[l] = s3
+            #         lead_scores_f6[l] = s6
+            #         
+            #     sv3_avg = torch.stack(list(lead_scores_v3.values()), dim=0).mean(dim=0)
+            #     sf6_avg = torch.stack(list(lead_scores_f6.values()), dim=0).mean(dim=0)
+            #     mask_avg_pre = get_mask(sv3_avg, sf6_avg, MEDIAN_LEN)
+            #     mask_avg_post = postprocess_mask(mask_avg_pre, fs=TARGET_FS)
+            #     
+            #     gt_med_mask = build_median_gt_mask(global_ann_corrected, TARGET_FS)
+            #     masks_dict = {
+            #         "Avg12 - Pre-PP (Fase 2)": mask_avg_pre,
+            #         "Avg12 - Post-PP (Fase 6)": mask_avg_post,
+            #     }
+            #     
+            #     # Cerca derivazione II per metriche specifiche se disponibile
+            #     lead_ii_key = next((k for k in median_sigs.keys() if k.lower() == 'ii'), None)
+            #     if lead_ii_key:
+            #         mask_ii_pre = get_mask(lead_scores_v3[lead_ii_key], lead_scores_f6[lead_ii_key], MEDIAN_LEN)
+            #         masks_dict["Lead II - Post-PP"] = postprocess_mask(mask_ii_pre, fs=TARGET_FS)
+            #         
+            #     render_metrics_tables(gt_med_mask, masks_dict, tol_ms, container=col_main)
 
 if __name__ == "__main__":
 
