@@ -760,10 +760,10 @@ def main():
     with st.sidebar.expander("ℹ️ Info Modelli", expanded=False):
         st.markdown("""
 **Ensemble 2+5+6 — Segmentazione clinica (separa ST)**
-P da Fase 2, QRS da Fase 5, T da Fase 6. Riproduce una vera separazione ST-T (durata mediana ST ≈90ms su LUDB, contro ≈104ms del ground truth manuale). Da usare quando serve accuratezza clinica reale.
+P da Fase 2, QRS da Fase 5, T da Fase 6. Riproduce una vera separazione ST-T: durata mediana ST ≈94ms su LUDB (media 103.6ms), contro ≈104ms mediana del ground truth manuale (media 112.7ms) — nessun battito con ST collassato a zero (0% entro ±20ms). Da usare quando serve accuratezza clinica reale.
 
 **Ensemble 2+5+2 — Compatibilità GE (forma T originale)**
-P da Fase 2, QRS da Fase 5, T da Fase 2. Riproduce fedelmente la convenzione GE che non separa lo ST (T_Onset ≈ QRS_Offset, durata ST ≈2ms). Da usare per compatibilità con la convenzione GE originale o come baseline di confronto — non per l'accuratezza clinica.
+P da Fase 2, QRS da Fase 5, T da Fase 2. Riproduce fedelmente la convenzione GE che non separa lo ST: durata mediana ST ≈2ms (media 5.5ms), con il 98.5% dei battiti entro ±20ms da zero. Da usare per compatibilità con la convenzione GE originale o come baseline di confronto — non per l'accuratezza clinica.
 
 **Fase 1 — Baseline LUDB**
 Addestrata e testata solo su LUDB (annotazione manuale, gold standard). Non ha mai visto dati GE reali. Riferimento per la qualità massima raggiungibile con supervisione perfetta.
