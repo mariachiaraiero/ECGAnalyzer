@@ -1036,11 +1036,15 @@ Addestrata e testata in-domain sul tracciato 10s GE (nessuna distillazione, come
                         for s in statements:
                             t = traduci_statement(s)
                             if not t: continue
+                            # Rimuove asterischi decorativi (es. "** MI ACUTO **")
+                            t = t.replace("*", "").strip()
+                            if not t: continue
                             if not grouped:
                                 grouped.append(t)
                             else:
-                                if t[0].islower() or t.lower().startswith("con ") or t.lower().startswith("ed ") or t.lower().startswith("e "):
-                                    grouped[-1] += " " + t
+                                # Unisci al precedente se inizia con virgola, punto e virgola, minuscola o congiunzione
+                                if t[0] in (',', ';') or t[0].islower() or t.lower().startswith("con ") or t.lower().startswith("ed ") or t.lower().startswith("e "):
+                                    grouped[-1] += " " + t.lstrip(",; ")
                                 else:
                                     grouped.append(t)
                         for g in grouped:
