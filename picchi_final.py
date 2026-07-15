@@ -11,7 +11,7 @@ Struttura del file:
   3. Mappe cliniche (classi patologiche, polarita' attese per derivazione)
   4. Parsing XML e preprocessing del segnale
   5. Segmentazione: maschere, intervalli, postprocessing
-  6. Helper condivisi per il peak detection
+  6. Helper condivisi per il peaka detection
   7. Detector QRS per macro-classe
   8. Detector P, T, J
   9. Dispatch dei detector (gestione multi-patologia)
@@ -907,22 +907,8 @@ def _estendi_s_in_st(sig, s, qrs_off, margine=12, esplorazione=50, freno=0.10):
 #     robusta rispetto alle deflessioni patologiche di grande ampiezza
 # =====================================================================
 
-def detect_qrs_standard(sig, qrs_on, qrs_off, qs_threshold_frac=0.15, qr_dominance=3.0, qr_min_frac=0.15):
-    """QRS standard. Usato per HEALTHY, NO_P e UNKNOWN.
-
-    Pattern atteso: complesso qRs fisiologico, con R nettamente dominante.
-
-    Logica:
-      1. Si prendono massimo e minimo assoluti della finestra QRS.
-      2. Vince quello con ampiezza maggiore rispetto alla baseline.
-      3. Se vince il massimo, caso normale: R e' quel massimo, Q e' il minimo a sinistra
-         di R, S e' il minimo a destra di R.
-      4. Se vince il minimo (Crollo dominante): la valle profonda è di default l'onda S,
-         e la R è l'ultima deflessione positiva pre-crollo.
-         Unica eccezione: se la risalita post-crollo domina su quella pre-crollo 
-         (rapporto >= qr_dominance) ed è sufficientemente prominente (>= qr_min_frac),
-         allora il crollo è una Q profonda e la R si trova a destra.
-    """
+def detect_qrs_standard(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=0.15, qr_dominance=3.0, qr_min_frac=0.15):
+    """QRS standard. Usato per HEALTHY, NO_P e UNKNOWN."""
     qrs_on, qrs_off = int(qrs_on), int(qrs_off)
     if qrs_off <= qrs_on + 2:
         return {"Q": None, "R": None, "S": None, "is_qs_complex": None}
@@ -935,56 +921,74 @@ def detect_qrs_standard(sig, qrs_on, qrs_off, qs_threshold_frac=0.15, qr_dominan
     val_r = abs(sig[r_cand] - baseline)
     val_s = abs(sig[s_cand] - baseline)
 
+    # ================= BYPASS ANTI-STEMI V1-V3 =================
+    lead_upper = (lead_name or "").upper().strip()
+    if lead_upper in {"V1", "V2", "V3"} and val_s > 0.05:
+        s_out = int(s_cand) # Forziamo la S nel cratere
+        
+        # Troviamo la R iniziale (o la forziamo se non c'è)
+        r_cand_pre = _extremum(sig, qrs_on, s_out, mode="max", baseline=baseline)
+        r_out = r_cand_pre if (r_cand_pre is not None and sig[r_cand_pre] - baseline > 0) else qrs_on
+        
+        # Troviamo la Q iniziale
+        q_cand_pre = _extremum(sig, qrs_on, r_out, mode="min", baseline=baseline)
+        q_out = q_cand_pre if q_cand_pre is not None else qrs_on
+        
+        # Costringiamo Q < R < S per sicurezza matematica
+        q_out = max(qrs_on, min(q_out, qrs_off - 2))
+        r_out = max(q_out + 1, min(r_out, qrs_off - 1))
+        s_out = max(r_out + 1, min(s_out, qrs_off))
+        
+        is_qs = bool(val_r < qs_threshold_frac * val_s)
+        return {"Q": q_out, "R": r_out, "S": s_out, "is_qs_complex": is_qs}
+    # ===========================================================
+
     is_qs = bool(val_s > 0 and val_r < qs_threshold_frac * val_s)
+    vince_r = (val_r >= val_s)
 
-    if val_r >= val_s:
-        # La deflessione positiva domina: complesso qRs classico
+    if vince_r:
         r = r_cand
-        q = _extremum(sig, qrs_on, r, mode="min", baseline=baseline) if r > qrs_on else qrs_on
-        s = _extremum(sig, r, qrs_off, mode="min", baseline=baseline) if r < qrs_off else qrs_off
+        q_cand = _extremum(sig, qrs_on, r, mode="min", baseline=baseline)
+        q = q_cand if (q_cand is not None and r > qrs_on) else qrs_on
+        s_cand_2 = _extremum(sig, r, qrs_off, mode="min", baseline=baseline)
+        s = s_cand_2 if (s_cand_2 is not None and r < qrs_off) else qrs_off
     else:
-        # La deflessione negativa domina. Applicazione regola proporzionale invariante di scala.
         profondita_valle = abs(sig[s_cand] - baseline)
-
-        # 1. Trova l'ampiezza dell'ultima deflessione positiva PRIMA del crollo
         cand_prima = _extremum(sig, qrs_on, s_cand, mode="max", baseline=baseline) if s_cand > qrs_on else None
         amp_prima = max(0.0, (sig[cand_prima] - baseline)) if cand_prima is not None else 0.0
         
-        # Gestione plateau estremo (onset cade direttamente sul crollo)
         if cand_prima is None and s_cand > qrs_on:
             amp_prima = max(0.0, sig[qrs_on] - baseline)
             cand_prima = qrs_on
 
-        # 2. Trova l'ampiezza della deflessione positiva DOPO il crollo
         cand_dopo = _extremum(sig, s_cand, qrs_off, mode="max", baseline=baseline) if s_cand < qrs_off else None
         amp_dopo = max(0.0, (sig[cand_dopo] - baseline)) if cand_dopo is not None else 0.0
 
-        # 3. Regola Invariante di Scala
         is_qr_pattern = (amp_dopo >= qr_dominance * max(amp_prima, 1e-9)) and (amp_dopo >= qr_min_frac * profondita_valle)
 
         if not is_qr_pattern:
-            # Pattern rS: la risalita non è schiacciante. Il crollo è la S. La R pre-crollo (plateau) comanda.
             s = s_cand
             r = cand_prima if (cand_prima is not None and sig[cand_prima] - baseline > 0) else qrs_on
-            q = _extremum(sig, qrs_on, r, mode="min", baseline=baseline) if r > qrs_on else qrs_on
+            q_cand = _extremum(sig, qrs_on, r, mode="min", baseline=baseline) if r > qrs_on else None
+            q = q_cand if q_cand is not None else qrs_on
         else:
-            # Pattern qR / QS puro: la risalita domina. Il crollo è un'onda Q patologica.
             q = s_cand
             r = cand_dopo if cand_dopo is not None else qrs_off
-            s = _extremum(sig, r, qrs_off, mode="min", baseline=baseline) if r < qrs_off else qrs_off
+            s_cand_2 = _extremum(sig, r, qrs_off, mode="min", baseline=baseline) if r < qrs_off else None
+            s = s_cand_2 if s_cand_2 is not None else qrs_off
 
-    # Anti-sovrapposizione
-    if r <= q:
-        r = min(q + 1, qrs_off - 1)
-    if q >= r:
-        q = max(qrs_on, r - 1)
-    if s <= r:
-        s = min(qrs_off, r + 1)
+    if q is None: q = qrs_on
+    if r is None: r = q + 1
+    if s is None: s = r + 1
+
+    if r <= q: r = min(q + 1, qrs_off - 1)
+    if q >= r: q = max(qrs_on, r - 1)
+    if s <= r: s = min(qrs_off, r + 1)
 
     return {"Q": q, "R": r, "S": s, "is_qs_complex": is_qs}
 
 
-def detect_qrs_old_mi(sig, qrs_on, qrs_off, qs_threshold_frac=0.25):
+def detect_qrs_old_mi(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=0.25):
     """QRS per infarto pregresso (OLD_MI).
 
     Pattern atteso: onde Q profonde e patologiche, complessi QS da necrosi.
@@ -994,10 +998,10 @@ def detect_qrs_old_mi(sig, qrs_on, qrs_off, qs_threshold_frac=0.25):
     permissiva, cosi' i complessi con R residua ma molto ridotta, tipici della necrosi,
     vengono correttamente riconosciuti come QS.
     """
-    return detect_qrs_standard(sig, qrs_on, qrs_off, qs_threshold_frac=qs_threshold_frac)
+    return detect_qrs_standard(sig, qrs_on, qrs_off, lead_name=lead_name, qs_threshold_frac=qs_threshold_frac)
 
 
-def detect_qrs_hypertrophy(sig, qrs_on, qrs_off, qs_threshold_frac=0.15):
+def detect_qrs_hypertrophy(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=0.15):
     """QRS per ipertrofia ventricolare (HYPERTROPHY).
 
     Pattern atteso: voltaggi molto elevati, morfologia per il resto conservata.
@@ -1009,36 +1013,12 @@ def detect_qrs_hypertrophy(sig, qrs_on, qrs_off, qs_threshold_frac=0.15):
     La funzione esiste come alias esplicito per rendere leggibile il dispatch e per
     poter differenziare i parametri in futuro senza toccare le altre classi.
     """
-    return detect_qrs_standard(sig, qrs_on, qrs_off, qs_threshold_frac=qs_threshold_frac)
+    return detect_qrs_standard(sig, qrs_on, qrs_off, lead_name=lead_name, qs_threshold_frac=qs_threshold_frac)
 
 
-def detect_qrs_wide_qrs(sig, qrs_on, qrs_off, qs_threshold_frac=0.15,
+def detect_qrs_wide_qrs(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=0.15,
                         prominence_frac=0.05, r_prime_frac=0.30):
-    """QRS largo: blocchi di branca, emiblocchi, ritardi di conduzione (WIDE_QRS).
-
-    Pattern attesi: rSR', tipico del blocco di branca destro; rS con S molto profonda;
-    QS puri.
-
-    La logica e' unificata attorno a un unico principio: si cerca SEMPRE, per prima cosa,
-    se esiste un candidato positivo genuino PRIMA del minimo assoluto della finestra.
-
-      1. s_cand e' il minimo assoluto della finestra.
-      2. Se esiste un massimo positivo prima di s_cand, anche minuscolo come la piccola r
-         di un rSR', allora quello e' R, indipendentemente dalla sua ampiezza rispetto a
-         cio' che viene dopo. Una deflessione negativa che segue una deflessione positiva
-         e' per definizione una S, non una Q.
-      3. Se invece non c'e' NULLA di positivo prima della valle, allora la valle e' una Q
-         profonda e il vero R va cercato come massimo prominente DOPO di essa.
-      4. R' e' il secondo massimo positivo dopo la S, marcato solo se prominente, cioe'
-         almeno il 30 per cento dell'ampiezza di R. Quando R' esiste, la S viene ricercata
-         come minimo assoluto nel tratto delimitato [R, R'].
-      5. Ordine garantito: Q < R < S < R'.
-
-    Questa formulazione sostituisce una precedente basata sul confronto di ampiezza tra
-    massimo e minimo globali. Quel criterio instradava derivazioni clinicamente identiche,
-    lo stesso battito visto in III e in AVF, su rami di codice diversi, e produceva
-    marcature incoerenti tra loro.
-    """
+    """QRS largo: blocchi di branca, emiblocchi, ritardi di conduzione (WIDE_QRS)."""
     qrs_on, qrs_off = int(qrs_on), int(qrs_off)
     if qrs_off <= qrs_on + 2:
         return {"Q": None, "R": None, "S": None, "R_prime": None, "is_qs_complex": None}
@@ -1051,36 +1031,45 @@ def detect_qrs_wide_qrs(sig, qrs_on, qrs_off, qs_threshold_frac=0.15,
     val_s = abs(sig[s_cand] - baseline)
     is_qs = bool(val_s > 0 and val_r < qs_threshold_frac * val_s)
 
-    # Esiste una deflessione positiva genuina prima del minimo assoluto?
-    # Se il massimo cade su qrs_on, significa che il segnale scende fin dall'inizio (onda Q).
     candidate_before = _extremum(sig, qrs_on, s_cand, mode="max", baseline=baseline) if s_cand > qrs_on else qrs_on
     noise_thresh = max(0.015, prominence_frac * (val_r + val_s))
     exists_before = candidate_before is not None and (candidate_before > qrs_on) and (sig[candidate_before] - baseline) > noise_thresh
 
+    # ================= BYPASS ANTI-STEMI V1-V3 (WIDE QRS) =================
+    lead_upper = (lead_name or "").upper().strip()
+    if lead_upper in {"V1", "V2", "V3"} and val_s > 0.05:
+        s_out = int(s_cand)
+        r_out = candidate_before if (candidate_before is not None and sig[candidate_before] - baseline > 0) else qrs_on
+        q_cand = _extremum(sig, qrs_on, r_out, mode="min", baseline=baseline)
+        q_out = q_cand if q_cand is not None else qrs_on
+
+        q_out = max(qrs_on, min(q_out, qrs_off - 2))
+        r_out = max(q_out + 1, min(r_out, qrs_off - 1))
+        s_out = max(r_out + 1, min(s_out, qrs_off))
+        
+        return {"Q": q_out, "R": r_out, "S": s_out, "R_prime": None, "is_qs_complex": is_qs}
+    # ======================================================================
+
     if exists_before:
-        # Pattern rS o rSR': la piccola r iniziale e' la R, la valle e' la S
         r = candidate_before
         s = s_cand
-        q = _extremum(sig, qrs_on, r, mode="min", baseline=baseline) if r > qrs_on else qrs_on
+        q_cand = _extremum(sig, qrs_on, r, mode="min", baseline=baseline) if r > qrs_on else None
+        q = q_cand if q_cand is not None else qrs_on
     else:
-        # Nessun rialzo prima della valle: la valle e' una Q profonda, la R sta dopo
         q = s_cand
         massimi_dopo, _ = _local_extrema(sig, s_cand, qrs_off, prominence_frac=prominence_frac)
         cand_dopo = [m for m in massimi_dopo if (sig[m] - baseline) > 0]
         if cand_dopo:
             r = max(cand_dopo, key=lambda m: sig[m] - baseline)
-            s = _minimo_dopo_R(sig, r, qrs_off, baseline) if r < qrs_off else qrs_off
+            s_cand_2 = _minimo_dopo_R(sig, r, qrs_off, baseline) if r < qrs_off else qrs_off
+            s = s_cand_2 if s_cand_2 is not None else qrs_off
         else:
-            # QS quasi puro: non esiste nessun candidato positivo da nessuna parte.
-            # Si ancora R al massimo globale della finestra, che e' comunque il punto meno
-            # negativo disponibile. Ancorarla invece al campione adiacente alla Q darebbe
-            # una R fortemente negativa nei complessi stretti e profondi.
             r = r_cand
             if r <= q:
                 q = min(q, r - 1) if r > qrs_on else qrs_on
-            s = _minimo_dopo_R(sig, r, qrs_off, baseline) if r < qrs_off else qrs_off
+            s_cand_2 = _minimo_dopo_R(sig, r, qrs_off, baseline) if r < qrs_off else qrs_off
+            s = s_cand_2 if s_cand_2 is not None else qrs_off
 
-    # Ricerca di R': secondo picco positivo dopo la S, se abbastanza prominente
     r_prime = None
     val_r_eff = abs(sig[r] - baseline)
     massimi, _ = _local_extrema(sig, s, qrs_off, prominence_frac=prominence_frac)
@@ -1089,33 +1078,37 @@ def detect_qrs_wide_qrs(sig, qrs_on, qrs_off, qs_threshold_frac=0.15,
         cand = max(massimi_dopo2, key=lambda m: sig[m] - baseline)
         if abs(sig[cand] - baseline) >= r_prime_frac * val_r_eff:
             r_prime = cand
-            # Con R' noto, la S e' il minimo nel tratto delimitato [R, R']
             if r < r_prime:
-                s = _extremum(sig, r, r_prime, mode="min", baseline=baseline)
+                s_cand_3 = _extremum(sig, r, r_prime, mode="min", baseline=baseline)
+                s = s_cand_3 if s_cand_3 is not None else s
 
-    # La Q non puo' essere un punto positivo: in quel caso si riporta all'onset
     if q != qrs_on and (sig[q] - baseline) >= 0:
         q = qrs_on
 
-    # Anti-sovrapposizione, con arretramento di R se non c'e' spazio per la S
-    if r <= q:
-        r = min(q + 1, qrs_off - 1)
-    if q >= r:
-        q = max(qrs_on, r - 1)
+    if r <= q: r = min(q + 1, qrs_off - 1)
+    if q >= r: q = max(qrs_on, r - 1)
     if s <= r:
-        if r < qrs_off:
-            s = r + 1
-        else:
-            r = max(q + 1, r - 1)
-            s = qrs_off
+        if r < qrs_off: s = r + 1
+        else: r = max(q + 1, r - 1); s = qrs_off
     if r_prime is not None and r_prime <= s:
         r_prime = None
 
     return {"Q": q, "R": r, "S": s, "R_prime": r_prime, "is_qs_complex": is_qs}
 
 
-def detect_qrs_avblock(sig, qrs_on, qrs_off, qs_threshold_frac=0.15):
-    """QRS per blocco atrio-ventricolare (AV_BLOCK) corretto per spike e rumore."""
+def detect_qrs_avblock(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=0.15):
+    """QRS per blocco atrio-ventricolare (AV_BLOCK) — con gestione spike pacemaker.
+
+    I pazienti con blocco AV hanno spesso un pacemaker impiantato: lo spike elettrico
+    del pacemaker puo' cadere dentro la finestra QRS e confondere il detector se non
+    viene neutralizzato. La funzione:
+
+      1. Cerca uno spike di pacing nei primi campioni della finestra QRS.
+      2. Se lo trova e il median filter conferma che e' un artefatto (ampiezza smooth
+         molto inferiore a quella raw), sposta l'inizio della ricerca subito dopo lo spike.
+      3. Sulla finestra "pulita" applica la stessa logica di detect_qrs_standard, incluso
+         il bypass anti-STEMI per V1-V3.
+    """
     qrs_on = int(max(0, qrs_on))
     qrs_off = int(min(len(sig) - 1, qrs_off))
 
@@ -1127,7 +1120,7 @@ def detect_qrs_avblock(sig, qrs_on, qrs_off, qs_threshold_frac=0.15):
     spike = _detect_pacing_spike(sig, spike_search_on, qrs_off, max_width_samples=4,
                                  slope_factor=5.0, return_tol_frac=0.9, min_slope=0.10,
                                  allow_biphasic=True)
-    
+
     ricerca_on = qrs_on
     if spike:
         st = max(0, spike[0] - spike_search_on)
@@ -1146,56 +1139,12 @@ def detect_qrs_avblock(sig, qrs_on, qrs_off, qs_threshold_frac=0.15):
             if ricerca_on + 1 < qrs_off:
                 ricerca_on += 1
 
-    # --- 2. LOGICA AV_BLOCK SUL SEGMENTO FISIOLOGICO RESTANTE ---
-    baseline = _baseline(sig, ricerca_on)
-    seg = sig[ricerca_on:qrs_off + 1] - baseline
-
-    k_size = 5 if len(seg) >= 5 else (3 if len(seg) >= 3 else 1)
-    seg_smoothed = medfilt(seg, kernel_size=k_size) if k_size > 1 else seg
-
-    val_max_smooth = np.max(seg_smoothed)
-    val_min_smooth = abs(np.min(seg_smoothed))
-    vince_s = bool(val_min_smooth > val_max_smooth * 1.2)
-
-    # N.B. Rimossa la ricerca di _local_extrema. Non serve più!
-
-    if vince_s:
-        # Caso A: cratere dominante
-        s_rel = int(np.argmin(seg))
-        s = ricerca_on + s_rel
-        r = ricerca_on + int(np.argmax(seg[:s_rel])) if s_rel > 0 else s
-        q = ricerca_on + int(np.argmin(seg[:int(r - ricerca_on)])) if r > ricerca_on else r
-        is_qs = bool(val_max_smooth < qs_threshold_frac * val_min_smooth)
-
-    else:
-        # Caso B: montagna dominante
-        r_rel = int(np.argmax(seg))
-        r = ricerca_on + r_rel
-
-        # NUOVA REGOLA PER LA S: immune al rumore, cerca il minimo assoluto 
-        # compreso tra la R e la fine della maschera rossa.
-        if r < qrs_off:
-            s = _extremum(sig, r, qrs_off, mode="min", baseline=baseline)
-        else:
-            s = qrs_off
-
-        q = ricerca_on + int(np.argmin(seg[:int(r - ricerca_on)])) if r > ricerca_on else r
-        is_qs = False
-
-    # Vincoli finali di sicurezza
-    q = max(ricerca_on, min(q, qrs_off))
-    r = max(ricerca_on, min(r, qrs_off))
-    s = max(ricerca_on, min(s, qrs_off))
-
-    if q > r: q = r
-    if s < r: s = r
-    if q == r and r > ricerca_on: q -= 1
-    if s == r and r < qrs_off: s += 1
-
-    return {"Q": q, "R": r, "S": s, "is_qs_complex": is_qs}
+    # --- 2. DELEGA A detect_qrs_standard SUL SEGMENTO PULITO ---
+    return detect_qrs_standard(sig, ricerca_on, qrs_off, lead_name=lead_name,
+                               qs_threshold_frac=qs_threshold_frac)
 
 
-def detect_qrs_pacing(sig, qrs_on, qrs_off):
+def detect_qrs_pacing(sig, qrs_on, qrs_off, lead_name=None):
     """QRS in presenza di pacemaker (PACING) - Corretto per spike e ringing."""
     qrs_on = int(max(0, qrs_on))
     qrs_off = int(min(len(sig) - 1, qrs_off))
@@ -1691,7 +1640,8 @@ def find_all_peaks(sig, boundaries, matched, lead_name, fs=TARGET_FS):
     # ========================================
 
     if boundaries["QRS_Onset"] is not None and boundaries["QRS_Offset"] is not None:
-        risultato.update(qrs_func(sig, qrs_on_input, boundaries["QRS_Offset"]))
+        # Passa lead_name al detector QRS
+        risultato.update(qrs_func(sig, qrs_on_input, boundaries["QRS_Offset"], lead_name=lead_name))
 
         # Separazione dei picchi degeneri. Nei complessi QS puri i detector collassano Q
         # ed R sullo stesso indice, perche' non esiste nessun massimo positivo. Qui si
