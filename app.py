@@ -368,21 +368,30 @@ def stamp_median_mask(beat_positions, sample_rate, median_mask, target_len, anch
 
 @st.cache_resource
 def load_models():
+    import glob
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model_v3_path = 'best_fase2_v3.pt'
-    model_f6_path = 'best_fase6.pt'
+    models_dict = {}
     
-    model_v3 = EnhancedUNetV3(in_channels=1, num_classes=4, f=12).to(device)
-    model_v3.load_state_dict(torch.load(model_v3_path, map_location=device))
-    model_v3.eval()
+    pt_files = glob.glob("best_fase*.pt")
     
-    model_f6 = ECGUNetFase6(in_channels=1, num_classes=4).to(device)
-    ckpt_f6 = torch.load(model_f6_path, map_location=device)
-    if isinstance(ckpt_f6, dict) and 'model_state_dict' in ckpt_f6: ckpt_f6 = ckpt_f6['model_state_dict']
-    cleaned_f6 = {k.replace('backbone.', '', 1) if k.startswith('backbone.') else k: v for k, v in ckpt_f6.items()}
-    model_f6.load_state_dict(cleaned_f6, strict=False)
-    model_f6.eval()
-    return model_v3, model_f6, device
+    for pt in pt_files:
+        name = pt.split('.')[0].replace('best_', '').capitalize()
+        if name == "Fase2_v3": name = "Fase2"
+            
+        model = EnhancedUNetV3(in_channels=1, num_classes=4, f=12).to(device)
+        ckpt = torch.load(pt, map_location=device)
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            ckpt = ckpt['model_state_dict']
+        ckpt = {k.replace('backbone.', '', 1) if k.startswith('backbone.') else k: v for k, v in ckpt.items()}
+        
+        try:
+            model.load_state_dict(ckpt, strict=True)
+            model.eval()
+            models_dict[name] = model
+        except Exception as e:
+            print(f"Errore caricamento {pt}: {e}")
+            
+    return models_dict, device
 
 # --- Funzioni di Plotting ---
 def compute_median_beat_from_continuous(sig, mask, gt_mask=None, fs=500, median_len=600):
@@ -527,13 +536,13 @@ def shade_segs(ax, segs, show_st=True):
             added = True
 
 
-def plot_single_median_beat(lead, sig, gt_mask_base, models, matched, fs=TARGET_FS, show_peaks=False):
-    model_v3, model_f6, device = models
+def plot_single_median_beat(lead, sig, gt_mask_base, models, matched, fs=TARGET_FS, show_peaks=False, model_choice="Ensemble", show_gt_st=False):
+    models_dict, device = models
     fig, axes = plt.subplots(1, 2, figsize=(11, 2.5), sharex=True, gridspec_kw={'wspace': 0.1})
     ax_gt, ax_pred = axes[0], axes[1]
     
     ax_gt.set_title(f"GT Ground Truth - {lead}", fontsize=10)
-    ax_pred.set_title(f"Predizione Ensemble + Picchi - {lead}", fontsize=10)
+    ax_pred.set_title(f"Predizione {model_choice} + Picchi - {lead}", fontsize=10)
     ax_gt.set_ylabel(lead, fontsize=12, fontweight='bold', rotation=0, labelpad=20)
     
     t_ms = np.arange(MEDIAN_LEN) * 1000 / fs
@@ -542,17 +551,46 @@ def plot_single_median_beat(lead, sig, gt_mask_base, models, matched, fs=TARGET_
     sig_norm = ((sig - np.mean(sig)) / (np.std(sig) + 1e-8)).astype(np.float32)
     sig_pad = np.pad(sig_norm, (4, 4), mode='constant')
     x = torch.tensor(sig_pad).unsqueeze(0).unsqueeze(0).to(device)
-    with torch.no_grad():
-        s_v3 = torch.nn.functional.softmax(model_v3(x), dim=1).squeeze(0).cpu()
-        s_f6 = torch.nn.functional.softmax(model_f6(x), dim=1).squeeze(0).cpu()
-    
-    pv3 = s_v3[:, 4:604].argmax(0).numpy()
-    pf6 = s_f6[:, 4:604].argmax(0).numpy()
     
     pred_mask = np.zeros(MEDIAN_LEN, dtype=np.int64)
-    pred_mask[pv3 == 2] = 2
-    pred_mask[pv3 == 1] = 1
-    pred_mask[pf6 == 3] = 3
+    with torch.no_grad():
+        if model_choice.startswith("Ensemble 2+5+6"):
+            model_p = models_dict.get("Fase2")
+            model_qrs = models_dict.get("Fase5")
+            model_t = models_dict.get("Fase6")
+            p_p = torch.nn.functional.softmax(model_p(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model_p else np.zeros(MEDIAN_LEN)
+            p_qrs = torch.nn.functional.softmax(model_qrs(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model_qrs else np.zeros(MEDIAN_LEN)
+            p_t = torch.nn.functional.softmax(model_t(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model_t else np.zeros(MEDIAN_LEN)
+            pred_mask[p_t == 3] = 3
+            pred_mask[p_p == 1] = 1
+            pred_mask[p_qrs == 2] = 2
+        elif model_choice.startswith("Ensemble 2+5+2"):
+            model_p = models_dict.get("Fase2")
+            model_qrs = models_dict.get("Fase5")
+            model_t = models_dict.get("Fase2")
+            p_p = torch.nn.functional.softmax(model_p(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model_p else np.zeros(MEDIAN_LEN)
+            p_qrs = torch.nn.functional.softmax(model_qrs(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model_qrs else np.zeros(MEDIAN_LEN)
+            p_t = torch.nn.functional.softmax(model_t(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model_t else np.zeros(MEDIAN_LEN)
+            pred_mask[p_t == 3] = 3
+            pred_mask[p_p == 1] = 1
+            pred_mask[p_qrs == 2] = 2
+            
+            # Remove ST gap by extending QRS wave to touch T onset
+            last_2 = -1
+            for i in range(len(pred_mask)):
+                if pred_mask[i] == 2: last_2 = i
+                elif pred_mask[i] == 3:
+                    if last_2 != -1: pred_mask[last_2+1:i] = 2
+                    last_2 = -1
+                elif pred_mask[i] == 1: last_2 = -1
+        else:
+            target_name = model_choice.replace("Solo ", "")
+            model = models_dict.get(target_name)
+            pm = torch.nn.functional.softmax(model(x), dim=1).squeeze(0).cpu()[:, 4:604].argmax(0).numpy() if model else np.zeros(MEDIAN_LEN)
+            pred_mask[pm == 2] = 2
+            pred_mask[pm == 1] = 1
+            pred_mask[pm == 3] = 3
+
     pred_mask = postprocess_mask(pred_mask, fs=fs)
     
     # 2. Trova picchi
@@ -565,7 +603,7 @@ def plot_single_median_beat(lead, sig, gt_mask_base, models, matched, fs=TARGET_
     
     # Plot GT
     ax_gt.plot(t_ms, sig, color='k', lw=1, ls='--', dash_capstyle='round', dashes=(1, 2))
-    shade_segs(ax_gt, extract_intervals_multibeat(gt_mask_base), show_st=False)
+    shade_segs(ax_gt, extract_intervals_multibeat(gt_mask_base), show_st=show_gt_st)
     
     # Plot Pred
     ax_pred.plot(t_ms, sig, color='k', lw=1, ls='--', dash_capstyle='round', dashes=(1, 2))
@@ -574,6 +612,8 @@ def plot_single_median_beat(lead, sig, gt_mask_base, models, matched, fs=TARGET_
     # Mark peaks
     if show_peaks:
         for p_name in ['Q', 'R', 'S', 'T', 'J']:
+            if p_name == 'J' and not (lead.upper() == 'AVR' or lead.upper().startswith('V')):
+                continue
             pos_x = peaks_dict.get(p_name)
             if pos_x is not None:
                 _mark_peak(ax_pred, sig, t_ms, pos_x, p_name, fs=fs, show_text=True)
@@ -598,7 +638,7 @@ def plot_single_median_beat(lead, sig, gt_mask_base, models, matched, fs=TARGET_
     return fig
 
 
-def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show_peaks=False, matched=set(), show_text=True):
+def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show_peaks=False, matched=set(), show_text=True, model_choice="Ensemble", show_gt_st=False):
     t_ms = np.arange(len(sig)) * 1000 / TARGET_FS
 
     gt_segs = extract_intervals_multibeat(gt_mask)
@@ -609,7 +649,7 @@ def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show
     
     # 1. Ground Truth
     axes[0].plot(t_ms, sig, color='k', lw=1)
-    shade_segs(axes[0], gt_segs, show_st=False)
+    shade_segs(axes[0], gt_segs, show_st=show_gt_st)
     axes[0].set_title(f"{title_mode} - Ground Truth", loc='left', color='#555', fontsize=10)
     axes[0].set_ylabel(lead_name, fontsize=12, fontweight='bold', rotation=0, labelpad=20)
     axes[0].legend(loc='upper right', framealpha=1.0)
@@ -618,7 +658,7 @@ def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show
     # 2. Pre-Processing
     axes[1].plot(t_ms, sig, color='k', lw=1)
     shade_segs(axes[1], pre_segs, show_st=True)
-    axes[1].set_title("2. Ensemble Diretto (Senza Post-Processing)", loc='left', color='#555', fontsize=10)
+    axes[1].set_title(f"2. {model_choice} Diretto (Senza Post-Processing)", loc='left', color='#555', fontsize=10)
     axes[1].legend(loc='upper right', framealpha=1.0)
     axes[1].grid(alpha=0.3)
 
@@ -670,7 +710,9 @@ def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show
             
             for key in ("Q", "R", "S", "T"):
                 _mark_peak(axes[2], sig, t_ms, peaks.get(key), key, fs=TARGET_FS, show_text=show_text)
-            _mark_peak(axes[2], sig, t_ms, peaks.get("J"), "J", fs=TARGET_FS, show_text=show_text)
+            
+            if lead_name.upper() == 'AVR' or lead_name.upper().startswith('V'):
+                _mark_peak(axes[2], sig, t_ms, peaks.get("J"), "J", fs=TARGET_FS, show_text=show_text)
             if peaks.get("is_p_bifasica"):
                 _mark_peak(axes[2], sig, t_ms, peaks.get("P_prime"), "P", fs=TARGET_FS, show_text=show_text)
             else:
@@ -680,7 +722,7 @@ def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show
                 axes[2].scatter([t_ms[idx]], [sig[idx]], marker="^", color="#81C784",
                                 s=30, zorder=8, edgecolors="white", linewidths=0.4)
 
-    axes[2].set_title("3. Ensemble con Post-Processing", loc='left', color='#555', fontsize=10)
+    axes[2].set_title(f"3. {model_choice} con Post-Processing", loc='left', color='#555', fontsize=10)
     axes[2].set_xlabel("Tempo (ms)")
     axes[2].legend(loc='upper right', framealpha=1.0)
     axes[2].grid(alpha=0.3)
@@ -689,7 +731,7 @@ def generate_plot(sig, gt_mask, pred_pre, pred_post, title_mode, lead_name, show
 
 # --- App Streamlit ---
 def main():
-    model_v3, model_f6, device = load_models()
+    models_dict, device = load_models()
     st.sidebar.title("Impostazioni")
     
     st.sidebar.markdown("### Guida al Caricamento")
@@ -712,6 +754,38 @@ def main():
         if f: uploaded_files = [f]
     else:
         uploaded_files = st.sidebar.file_uploader("Carica file LUDB (.dat, .hea, annotazioni)", accept_multiple_files=True)
+    model_choices = ["Ensemble 2+5+6 (migliore per ST)", "Ensemble 2+5+2 (migliore per solo T)"] + [f"Solo {k}" for k in sorted(list(models_dict.keys()))]
+    model_choice = st.sidebar.selectbox("Scelta Modello per Maschere", model_choices)
+    
+    with st.sidebar.expander("ℹ️ Info Modelli", expanded=False):
+        st.markdown("""
+**Ensemble 2+5+6 — Segmentazione clinica (separa ST)**
+P da Fase 2, QRS da Fase 5, T da Fase 6. Riproduce una vera separazione ST-T (durata mediana ST ≈90ms su LUDB, contro ≈104ms del ground truth manuale). Da usare quando serve accuratezza clinica reale.
+
+**Ensemble 2+5+2 — Compatibilità GE (forma T originale)**
+P da Fase 2, QRS da Fase 5, T da Fase 2. Riproduce fedelmente la convenzione GE che non separa lo ST (T_Onset ≈ QRS_Offset, durata ST ≈2ms). Da usare per compatibilità con la convenzione GE originale o come baseline di confronto — non per l'accuratezza clinica.
+
+**Fase 1 — Baseline LUDB**
+Addestrata e testata solo su LUDB (annotazione manuale, gold standard). Non ha mai visto dati GE reali. Riferimento per la qualità massima raggiungibile con supervisione perfetta.
+
+**Fase 2 — Baseline PRIV battito medio**
+Addestrata sui battiti mediani (600 campioni) estratti dai file GE MAC2000, con l'annotazione automatica GE. In-domain sul formato "beat mediano".
+
+**Fase 3 — Distillazione battito medio**
+Come Fase 2, ma con knowledge distillation dal modello LUDB per correggere il bias di annotazione GE (in particolare sulla T). Stesso formato di input di Fase 2.
+
+**Fase 5 — Timbro grezzo (lower bound)**
+Addestrata direttamente sul tracciato 10s grezzo GE (nessuna distillazione). Il più robusto sulle onde P e QRS in generalizzazione cross-dominio, ma eredita il bias GE sulla T.
+
+**Fase 6 — Distillazione timbro**
+Come Fase 5, ma con distillazione dalla convenzione LUDB per correggere la T (separazione ST). Pensata specificamente per la componente T dell'ensemble.
+
+**Fase 7 — Combined PRIV+LUDB**
+Addestrata su un dataset che unisce PRIV timbro e LUDB. Generalizza meglio di Fase 6 sulla T quando testata su segnali GE reali.
+
+**Fase 8 — PRIV timbro in-domain**
+Addestrata e testata in-domain sul tracciato 10s GE (nessuna distillazione, come Fase 5 ma verificata specificamente su questo dominio). Riproduce fedelmente la convenzione T originale GE (T_Onset = QRS_Offset, nessun ST).
+        """)
     
     if uploaded_files:
         is_ge = (data_source == "GE (XML)")
@@ -769,20 +843,72 @@ def main():
             else:
                 sig_pad = np.pad(sig_norm, (4, 4), mode='constant')
             x = torch.tensor(sig_pad).unsqueeze(0).unsqueeze(0).to(device)
+            
+            res = {}
             with torch.no_grad():
-                s_v3 = torch.nn.functional.softmax(model_v3(x), dim=1).squeeze(0).cpu()
-                s_f6 = torch.nn.functional.softmax(model_f6(x), dim=1).squeeze(0).cpu()
+                if model_choice.startswith("Ensemble 2+5+6"):
+                    model_p = models_dict.get("Fase2")
+                    model_qrs = models_dict.get("Fase5")
+                    model_t = models_dict.get("Fase6")
+                    if model_p: res["Fase2_p"] = torch.nn.functional.softmax(model_p(x), dim=1).squeeze(0).cpu()
+                    if model_qrs: res["Fase5_qrs"] = torch.nn.functional.softmax(model_qrs(x), dim=1).squeeze(0).cpu()
+                    if model_t: res["Fase6_t"] = torch.nn.functional.softmax(model_t(x), dim=1).squeeze(0).cpu()
+                elif model_choice.startswith("Ensemble 2+5+2"):
+                    model_p = models_dict.get("Fase2")
+                    model_qrs = models_dict.get("Fase5")
+                    model_t = models_dict.get("Fase2")
+                    if model_p: res["Fase2_p"] = torch.nn.functional.softmax(model_p(x), dim=1).squeeze(0).cpu()
+                    if model_qrs: res["Fase5_qrs"] = torch.nn.functional.softmax(model_qrs(x), dim=1).squeeze(0).cpu()
+                    if model_t: res["Fase2_t"] = torch.nn.functional.softmax(model_t(x), dim=1).squeeze(0).cpu()
+                else:
+                    target_name = model_choice.replace("Solo ", "")
+                    model = models_dict.get(target_name)
+                    if model: res[target_name] = torch.nn.functional.softmax(model(x), dim=1).squeeze(0).cpu()
+            
             if is_cont:
-                return s_v3[:, :n_len], s_f6[:, :n_len]
+                return {k: v[:, :n_len] for k, v in res.items()}
             else:
-                return s_v3[:, 4:604], s_f6[:, 4:604]
+                return {k: v[:, 4:604] for k, v in res.items()}
 
-        def get_mask(sv3, sf6, length):
-            pv3, pf6 = sv3.argmax(0).numpy(), sf6.argmax(0).numpy()
+        def get_mask(scores_dict, length):
             mask = np.zeros(length, dtype=np.int64)
-            mask[pv3 == 2] = 2
-            mask[pv3 == 1] = 1
-            mask[pf6 == 3] = 3
+            if model_choice.startswith("Ensemble 2+5+6"):
+                s_p = scores_dict.get("Fase2_p")
+                s_qrs = scores_dict.get("Fase5_qrs")
+                s_t = scores_dict.get("Fase6_t")
+                p_p = s_p.argmax(0).numpy() if s_p is not None else np.zeros(length)
+                p_qrs = s_qrs.argmax(0).numpy() if s_qrs is not None else np.zeros(length)
+                p_t = s_t.argmax(0).numpy() if s_t is not None else np.zeros(length)
+                mask[p_t == 3] = 3
+                mask[p_p == 1] = 1
+                mask[p_qrs == 2] = 2
+            elif model_choice.startswith("Ensemble 2+5+2"):
+                s_p = scores_dict.get("Fase2_p")
+                s_qrs = scores_dict.get("Fase5_qrs")
+                s_t = scores_dict.get("Fase2_t")
+                p_p = s_p.argmax(0).numpy() if s_p is not None else np.zeros(length)
+                p_qrs = s_qrs.argmax(0).numpy() if s_qrs is not None else np.zeros(length)
+                p_t = s_t.argmax(0).numpy() if s_t is not None else np.zeros(length)
+                mask[p_t == 3] = 3
+                mask[p_p == 1] = 1
+                mask[p_qrs == 2] = 2
+                
+                # Remove ST gap by extending QRS wave to touch T onset
+                last_2 = -1
+                for i in range(length):
+                    if mask[i] == 2: last_2 = i
+                    elif mask[i] == 3:
+                        if last_2 != -1: mask[last_2+1:i] = 2
+                        last_2 = -1
+                    elif mask[i] == 1: last_2 = -1
+            else:
+                target_name = model_choice.replace("Solo ", "")
+                s_model = scores_dict.get(target_name)
+                if s_model is not None:
+                    pm = s_model.argmax(0).numpy()
+                    mask[pm == 2] = 2
+                    mask[pm == 1] = 1
+                    mask[pm == 3] = 3
             return mask
 
         def render_metrics_tables(gt_mask, masks_dict, current_tol, container=st):
@@ -925,11 +1051,9 @@ def main():
         if not is_ge:
             
             # Pre-calcolo inferenza per LUDB (che usa tutto l'elenco)
-            lead_scores_v3, lead_scores_f6 = {}, {}
+            lead_scores = {}
             for l, s_ in cont_sigs.items():
-                s3, s6 = run_inference(s_, is_cont=True)
-                lead_scores_v3[l] = s3
-                lead_scores_f6[l] = s6
+                lead_scores[l] = run_inference(s_, is_cont=True)
 
             ludb_median_sigs = {}
 
@@ -938,8 +1062,8 @@ def main():
                 if cont_raw is None: continue
                 n_len = len(cont_raw)
                 
-                sv3_single, sf6_single = lead_scores_v3[cont_lead], lead_scores_f6[cont_lead]
-                mask_single_pre = get_mask(sv3_single, sf6_single, n_len)
+                scores_single = lead_scores[cont_lead]
+                mask_single_pre = get_mask(scores_single, n_len)
                 mask_single_post = postprocess_mask_multibeat(mask_single_pre, fs=TARGET_FS)
                 
                 pred_mask = mask_single_pre
@@ -959,7 +1083,7 @@ def main():
                 
                 
                 fig_cont = generate_plot(sig_plot, gt_mask_plot, pred_mask_plot, pred_post_plot, 
-                                         f"Derivazione {cont_lead}", cont_lead, False, matched, show_text=False)
+                                         f"Derivazione {cont_lead}", cont_lead, False, matched, show_text=False, model_choice=model_choice, show_gt_st=True)
                 col_main.pyplot(fig_cont, use_container_width=True)
                 
                 # Calcola il battito medio E la maschera GT mediana
@@ -968,7 +1092,7 @@ def main():
                 if med_beat is not None:
                     # Mostra subito il battito medio sotto al tracciato di questa derivazione
                     col_main.markdown(f"**Battito Medio Sintetico - Derivazione {cont_lead}**")
-                    fig_med = plot_single_median_beat(cont_lead, med_beat, med_gt_mask, (model_v3, model_f6, device), matched, fs=TARGET_FS, show_peaks=show_peaks)
+                    fig_med = plot_single_median_beat(cont_lead, med_beat, med_gt_mask, (models_dict, device), matched, fs=TARGET_FS, show_peaks=show_peaks, model_choice=model_choice, show_gt_st=True)
                     col_main.pyplot(fig_med, use_container_width=True)
                 
         else:
@@ -992,8 +1116,8 @@ def main():
                     n_len = len(cont_raw)
                     sig_med_cont = median_sigs.get(lead)
                     if sig_med_cont is not None:
-                        s3, s6 = run_inference(sig_med_cont, is_cont=False)
-                        mask_med_pre = get_mask(s3, s6, MEDIAN_LEN)
+                        scores_dict = run_inference(sig_med_cont, is_cont=False)
+                        mask_med_pre = get_mask(scores_dict, MEDIAN_LEN)
                         mask_med_post = postprocess_mask(mask_med_pre, fs=TARGET_FS)
                     else:
                         mask_med_pre = np.zeros(MEDIAN_LEN, dtype=np.int64)
@@ -1013,13 +1137,13 @@ def main():
                         col_main.warning("⚠ Attenzione: per la classe PACING il ground truth su questo tracciato a 10s è meno affidabile. Le bande derivano dal beat mediano GE, che cattura solo la morfologia dominante del paziente — se il tracciato mescola battiti intrinseci e stimolati, le annotazioni possono non essere corrette su alcuni battiti del tracciato.")
                     
                     fig_cont = generate_plot(sig_plot, gt_mask_plot, pred_mask_plot, pred_post_plot, 
-                                             f"Derivazione {lead}", lead, False, matched, show_text=False)
+                                             f"Derivazione {lead}", lead, False, matched, show_text=False, model_choice=model_choice)
                     col_main.pyplot(fig_cont, use_container_width=True)
                     
                 # 2. Battito Mediano (se disponibile)
                 if lead in median_sigs:
                     sig = median_sigs[lead]
-                    fig_med = plot_single_median_beat(lead, sig, gt_mask_base, (model_v3, model_f6, device), matched, fs=TARGET_FS, show_peaks=show_peaks)
+                    fig_med = plot_single_median_beat(lead, sig, gt_mask_base, (models_dict, device), matched, fs=TARGET_FS, show_peaks=show_peaks, model_choice=model_choice)
                     col_main.pyplot(fig_med, use_container_width=True)
                     
 
