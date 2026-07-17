@@ -923,7 +923,7 @@ def detect_qrs_standard(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=
 
     # ================= BYPASS ANTI-STEMI V1-V3 =================
     lead_upper = (lead_name or "").upper().strip()
-    if lead_upper in {"V1", "V2", "V3"} and val_s > 0.05:
+    if lead_upper in {"V1", "V2", "V3", "AVR"} and val_s > 0.05:
         s_out = int(s_cand) # Forziamo la S nel cratere
         
         # Troviamo la R iniziale (o la forziamo se non c'è)
@@ -1037,7 +1037,7 @@ def detect_qrs_wide_qrs(sig, qrs_on, qrs_off, lead_name=None, qs_threshold_frac=
 
     # ================= BYPASS ANTI-STEMI V1-V3 (WIDE QRS) =================
     lead_upper = (lead_name or "").upper().strip()
-    if lead_upper in {"V1", "V2", "V3"} and val_s > 0.05:
+    if lead_upper in {"V1", "V2", "V3", "AVR"} and val_s > 0.05:
         s_out = int(s_cand)
         r_out = candidate_before if (candidate_before is not None and sig[candidate_before] - baseline > 0) else qrs_on
         q_cand = _extremum(sig, qrs_on, r_out, mode="min", baseline=baseline)
