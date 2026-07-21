@@ -51,7 +51,7 @@ Per avviare l'applicazione in locale, assicurati che i pesi dei modelli (es. `be
 streamlit run app.py
 ```
 
-Il browser si aprirà automaticamente all'indirizzo `http://localhost:8501`. 
+Il browser si aprirà automaticamente all'indirizzo `https://ecganalyzer.streamlit.app/`. 
 Tramite la sidebar potrai:
 - Caricare il file `.xml` del paziente.
 - Selezionare le derivazioni (Leads) da ispezionare (I, II, V1-V6, ecc.).
