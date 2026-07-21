@@ -266,49 +266,10 @@ def filter_beats_by_loo(beat_positions, sample_rate, strip_sig, qrs_onset_offset
             
     return valid_indices
 
-def outward_search_boundaries(sig_med, anchor_s=250, fs=TARGET_FS):
-    n = len(sig_med)
-    edge_w = int(0.10 * fs)
-    edges = np.concatenate([sig_med[:edge_w], sig_med[-edge_w:]])
-    baseline = np.median(edges)
-    noise_std = max(np.std(edges), 1e-6)
-    thr = 2.5 * noise_std 
-    ws = max(0, anchor_s - int(0.08*fs))
-    we = min(n, anchor_s + int(0.08*fs))
-    spike_idx = ws + int(np.argmax(np.abs(sig_med[ws:we])))
-    start_idx = spike_idx
-    w_back = int(0.02 * fs)
-    for i in range(spike_idx, w_back, -1):
-        if np.all(np.abs(sig_med[i-w_back:i] - baseline) < thr):
-            start_idx = i; break
-    end_idx = spike_idx
-    w_fwd = int(0.05 * fs)
-    for i in range(spike_idx, n - w_fwd):
-        if np.all(np.abs(sig_med[i:i+w_fwd] - baseline) < thr):
-            end_idx = i; break
-    q_onset = max(start_idx, spike_idx - int(0.03*fs))
-    j_point = min(end_idx, spike_idx + int(0.30*fs))
-    srch_s = spike_idx + int(0.02*fs)
-    if end_idx - srch_s > 10:
-        d = np.abs(np.diff(sig_med[srch_s:end_idx]))
-        sm = np.convolve(d, np.ones(9)/9, mode='same')
-        j_thr = 0.15 * np.max(sm) if np.max(sm) > 0 else 1.0
-        for i in range(len(sm)):
-            if sm[i] < j_thr:
-                j_point = srch_s + i; break
-    ms = lambda s: round(s * 1000 / fs)
-    return {'P_Onset': ms(start_idx), 'P_Offset': ms(q_onset),
-            'Q_Onset': ms(q_onset), 'Q_Offset': ms(j_point),
-            'T_Onset': ms(j_point), 'T_Offset': ms(end_idx)}
-
 def get_corrected_pacing_ann(global_ann, median_sigs, matched):
-    if 'PACING' in matched and median_sigs:
-        ref_lead = 'II' if 'II' in median_sigs else list(median_sigs.keys())[0]
-        sig_med = median_sigs[ref_lead]
-        # Normalize as in inference
-        sig_med = (sig_med - np.mean(sig_med)) / (np.std(sig_med) + 1e-8)
-        return outward_search_boundaries(sig_med)
+    # Utilizza sempre le annotazioni globali reali fornite dal dispositivo GE
     return global_ann
+
 
 
 def build_median_gt_mask(global_ann, fs=TARGET_FS):
@@ -335,67 +296,26 @@ def build_median_gt_mask(global_ann, fs=TARGET_FS):
     return mask
 
 def build_continuous_mask_from_ann(beat_positions, sample_rate, global_ann, target_len, matched=set(), strip_sig=None, corr_threshold=0.0):
-    mask = np.zeros(target_len, dtype=np.int64)
-    fs = TARGET_FS
-    tocs_sorted = sorted(beat_positions)
-    
-    if not tocs_sorted:
-        return mask
-        
-    p_onset = global_ann.get('P_Onset') or global_ann.get('POnset')
-    p_offset = global_ann.get('P_Offset') or global_ann.get('POffset')
-    q_onset = global_ann.get('Q_Onset') or global_ann.get('QOnset')
-    q_offset = global_ann.get('Q_Offset') or global_ann.get('QOffset')
-    t_offset = global_ann.get('T_Offset') or global_ann.get('TOffset')
-    t_onset = global_ann.get('T_Onset') or q_offset
+    if not beat_positions or not global_ann:
+        return np.zeros(target_len, dtype=np.int64)
+    gt_med_mask = build_median_gt_mask(global_ann, fs=TARGET_FS)
+    return stamp_median_mask(beat_positions, sample_rate, gt_med_mask, target_len, strip_sig=strip_sig, corr_threshold=corr_threshold)
 
-    valid_indices = filter_beats_by_loo(
-        tocs_sorted, sample_rate, strip_sig, 
-        qrs_onset_offset=(q_onset, q_offset), 
-        corr_threshold=corr_threshold
-    )
-
-    if 'PACING' in matched:
-        for i, toc_native in enumerate(tocs_sorted):
-            if i not in valid_indices: continue
-            toc_t = int(toc_native * fs / sample_rate)
-            ms = fs / 1000.0  # campioni per ms
-            p_s  = max(0, toc_t - int(250*ms));  p_e  = max(0, toc_t - int(80*ms))
-            q_s  = max(0, toc_t - int(20*ms));   q_e  = min(target_len-1, toc_t + int(160*ms))
-            t_s  = min(target_len-1, q_e);        t_e  = min(target_len-1, toc_t + int(400*ms))
-            if p_s < p_e: mask[p_s:p_e+1] = 1
-            if q_s < q_e: mask[q_s:q_e+1] = 2
-            if t_s < t_e: mask[t_s:t_e+1] = 3
-        return mask
-
-    for i, toc_native in enumerate(tocs_sorted):
-        if i not in valid_indices: continue
-        toc_t = int(toc_native * fs / sample_rate)
-        def proj(ms_val): return toc_t + int((ms_val - 500) * fs / 1000.0)
-        
-        if p_onset is not None and p_offset is not None:
-            s, e = max(0, proj(p_onset)), min(target_len-1, proj(p_offset))
-            if s < e: mask[s:e+1] = 1
-        if q_onset is not None and q_offset is not None:
-            s, e = max(0, proj(q_onset)), min(target_len-1, proj(q_offset))
-            if s < e: mask[s:e+1] = 2
-        if t_onset is not None and t_offset is not None:
-            s, e = max(0, proj(t_onset)), min(target_len-1, proj(t_offset))
-            if s < e: mask[s:e+1] = 3
-    return mask
 
 def stamp_median_mask(beat_positions, sample_rate, median_mask, target_len, anchor_ms=500, strip_sig=None, corr_threshold=0.0):
     mask = np.zeros(target_len, dtype=np.int64)
     segs = extract_intervals_multibeat(median_mask)
     
+    # L'ancoraggio DEVE sempre essere a 500ms (il fiducial point R-peak nativo di GE)
+    anchor_idx = int(anchor_ms * TARGET_FS / 1000.0)
+
     qrs_segs = segs[2]  # class 2 = QRS
     if qrs_segs:
-        q_on, q_off = qrs_segs[0]
-        anchor_idx = (q_on + q_off) // 2
+        main_qrs = max(qrs_segs, key=lambda s: s[1] - s[0])
+        q_on, q_off = main_qrs
         qrs_ms_on = q_on * 1000.0 / TARGET_FS
         qrs_ms_off = q_off * 1000.0 / TARGET_FS
     else:
-        anchor_idx = int(anchor_ms * TARGET_FS / 1000.0)
         qrs_ms_on, qrs_ms_off = None, None
 
     tocs_sorted = sorted(beat_positions)
@@ -997,8 +917,6 @@ Addestrata e testata in-domain sul tracciato 10s GE (nessuna distillazione, come
 
         
         global_ann_corrected = global_ann.copy() if global_ann else {}
-        if is_ge:
-            global_ann_corrected = get_corrected_pacing_ann(global_ann, median_sigs, matched)
 
         col_main, col_side = st.columns([3, 1])
         with col_side:
