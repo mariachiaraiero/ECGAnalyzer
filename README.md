@@ -65,9 +65,6 @@ Tramite la sidebar potrai:
 - `picchi_final.py`: Gestisce le logiche avanzate per l'estrazione delle ampiezze dei picchi dai segnali medi, simulando il posizionamento della baseline dell'algoritmo nativo di GE.
 - `ludb_parser.py`: Modulo opzionale per il parsing di database pubblici come LUDB.
 
-## 📸 Screenshots
-*(Aggiungi qui un'immagine dell'app in funzione)*
-`![ECG Viewer Screenshot](percorso/immagine.png)`
 
 ---
 *Progettato per la validazione visuale rapida, il testing clinico e il debugging delle architetture di Deep Learning applicate ai segnali elettrocardiografici complessi.*
