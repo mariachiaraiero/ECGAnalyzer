@@ -192,58 +192,79 @@ def parse_ludb_wfdb(tmpdir, record_name):
         
     return cont_sigs, gt_masks
 
-def build_continuous_mask_from_ann(beat_positions, sample_rate, ann, target_len, matched=set()):
-    mask = np.zeros(target_len, dtype=np.int64)
+# --- Logica Self-Template LOO per Riallineamento e Filtraggio Battiti ---
+def corr_score(template, candidate):
+    """Correlazione di Pearson tra template e candidate, ricampionando il
+    candidate alla lunghezza del template (interpolazione lineare)."""
+    if template is None or len(template) < 3 or len(candidate) < 3:
+        return 0.0
+    n = len(template)
+    x_old = np.linspace(0, 1, len(candidate))
+    x_new = np.linspace(0, 1, n)
+    cand_rs = np.interp(x_new, x_old, candidate)
+    if np.std(template) < 1e-9 or np.std(cand_rs) < 1e-9:
+        return 0.0
+    return float(np.corrcoef(template, cand_rs)[0, 1])
+
+def filter_beats_by_loo(beat_positions, sample_rate, strip_sig, qrs_onset_offset=(None, None), corr_threshold=0.7, target_fs=TARGET_FS):
+    """
+    Filtra i battiti nel tracciato 10s usando il Self-Template LOO (mediana degli altri battiti).
+    Ritorna un set di indici i (relativi a beat_positions ordinati) che superano la soglia.
+    Se corr_threshold <= 0.0, strip_sig è assente o meno di 2 battiti, ritorna tutti i battiti.
+    """
+    if corr_threshold <= 0.0 or not beat_positions or len(beat_positions) < 2 or strip_sig is None:
+        return set(range(len(beat_positions)))
     
-    if 'PACING' in matched:
-        # Per PACING: le annotazioni GE rappresentano solo il tick di stimolazione elettrica.
-        # Usiamo offset fisiologici fissi dal toc (spike) per ricostruire boundaries reali.
-        # Valori tipici per un battito paceato ventricoale a freq normale:
-        #   P (atrial activity/sensing): toc - 250ms -> toc - 80ms
-        #   QRS (spike + complesso paceato): toc - 20ms -> toc + 160ms
-        #   T (onda T paceata): toc + 160ms -> toc + 400ms
-        for toc_native in sorted(beat_positions):
-            toc_t = int(toc_native * TARGET_FS / sample_rate)
-            ms = TARGET_FS / 1000.0  # campioni per ms
-            p_s  = max(0, toc_t - int(250*ms));  p_e  = max(0, toc_t - int(80*ms))
-            q_s  = max(0, toc_t - int(20*ms));   q_e  = min(target_len-1, toc_t + int(160*ms))
-            t_s  = min(target_len-1, q_e);        t_e  = min(target_len-1, toc_t + int(400*ms))
-            if p_s < p_e: mask[p_s:p_e+1] = 1
-            if q_s < q_e: mask[q_s:q_e+1] = 2
-            if t_s < t_e: mask[t_s:t_e+1] = 3
-        return mask
-
-    p_onset = ann.get('P_Onset'); p_offset = ann.get('P_Offset')
-    q_onset = ann.get('Q_Onset'); q_offset = ann.get('Q_Offset')
-    t_onset = ann.get('T_Onset'); t_offset = ann.get('T_Offset')
-
-    if q_onset is None or not beat_positions:
-        return mask
-
+    tocs_sorted = sorted(beat_positions)
+    target_len = len(strip_sig)
+    
+    # Segnale filtrato per il calcolo della correlazione
+    strip_sig_filt = apply_ecg_filters(strip_sig.astype(np.float64), fs=target_fs)
+    
+    q_on, q_off = qrs_onset_offset
     anchor_ms = 500
-    for toc_native in sorted(beat_positions):
-        toc_t = int(toc_native * TARGET_FS / sample_rate)
-        def proj(ann_ms): return toc_t + int((ann_ms - anchor_ms) * TARGET_FS / 1000)
-
-        if p_onset is not None and p_offset is not None:
-            ps = max(0, proj(p_onset)); pe = min(target_len - 1, proj(p_offset))
-            if ps < pe: mask[ps:pe + 1] = 1
-
-        if q_onset is not None and q_offset is not None:
-            qs = max(0, proj(q_onset)); qe = min(target_len - 1, proj(q_offset))
-            if qs < qe: mask[qs:qe + 1] = 2
-
-        if q_offset is not None and t_onset is not None:
-            ss = max(0, proj(q_offset)); se = min(target_len - 1, proj(t_onset))
-            if ss < se: mask[ss:se + 1] = 4
-
-        t_start = t_onset if t_onset is not None else q_offset
-        if t_start is not None and t_offset is not None:
-            ts = max(0, proj(t_start)); te = min(target_len - 1, proj(t_offset))
-            if ts < te: mask[ts:te + 1] = 3
-
-    return mask
-
+    
+    windows = []
+    toc_ts = []
+    for toc_native in tocs_sorted:
+        toc_t = int(toc_native * target_fs / sample_rate)
+        toc_ts.append(toc_t)
+        
+        if q_on is not None and q_off is not None:
+            qs = max(0, toc_t + int((q_on - anchor_ms) * target_fs / 1000.0))
+            qe = min(target_len - 1, toc_t + int((q_off - anchor_ms) * target_fs / 1000.0))
+        else:
+            qs = max(0, toc_t - int(50 * target_fs / 1000.0))
+            qe = min(target_len - 1, toc_t + int(70 * target_fs / 1000.0))
+            
+        seg = strip_sig_filt[max(0, qs - 5):min(target_len, qe + 6)]
+        windows.append(seg)
+        
+    lens = [len(w) for w in windows]
+    if not lens:
+        return set(range(len(beat_positions)))
+    ref_len = max(3, int(np.median(lens)))
+    
+    resampled = np.zeros((len(windows), ref_len))
+    for i, seg in enumerate(windows):
+        if len(seg) < 3:
+            continue
+        x_old = np.linspace(0, 1, len(seg))
+        x_new = np.linspace(0, 1, ref_len)
+        resampled[i] = np.interp(x_new, x_old, seg)
+        
+    valid_indices = set()
+    for i in range(len(tocs_sorted)):
+        others = np.delete(resampled, i, axis=0)
+        if len(others) == 0:
+            valid_indices.add(i)
+            continue
+        template_loo = np.median(others, axis=0)
+        score = corr_score(template_loo, resampled[i])
+        if score >= corr_threshold:
+            valid_indices.add(i)
+            
+    return valid_indices
 
 def outward_search_boundaries(sig_med, anchor_s=250, fs=TARGET_FS):
     n = len(sig_med)
@@ -313,10 +334,14 @@ def build_median_gt_mask(global_ann, fs=TARGET_FS):
         if s < e: mask[s:e+1] = 3
     return mask
 
-def build_continuous_mask_from_ann(beat_positions, sample_rate, global_ann, target_len):
+def build_continuous_mask_from_ann(beat_positions, sample_rate, global_ann, target_len, matched=set(), strip_sig=None, corr_threshold=0.0):
     mask = np.zeros(target_len, dtype=np.int64)
     fs = TARGET_FS
+    tocs_sorted = sorted(beat_positions)
     
+    if not tocs_sorted:
+        return mask
+        
     p_onset = global_ann.get('P_Onset') or global_ann.get('POnset')
     p_offset = global_ann.get('P_Offset') or global_ann.get('POffset')
     q_onset = global_ann.get('Q_Onset') or global_ann.get('QOnset')
@@ -324,7 +349,27 @@ def build_continuous_mask_from_ann(beat_positions, sample_rate, global_ann, targ
     t_offset = global_ann.get('T_Offset') or global_ann.get('TOffset')
     t_onset = global_ann.get('T_Onset') or q_offset
 
-    for toc_native in sorted(beat_positions):
+    valid_indices = filter_beats_by_loo(
+        tocs_sorted, sample_rate, strip_sig, 
+        qrs_onset_offset=(q_onset, q_offset), 
+        corr_threshold=corr_threshold
+    )
+
+    if 'PACING' in matched:
+        for i, toc_native in enumerate(tocs_sorted):
+            if i not in valid_indices: continue
+            toc_t = int(toc_native * fs / sample_rate)
+            ms = fs / 1000.0  # campioni per ms
+            p_s  = max(0, toc_t - int(250*ms));  p_e  = max(0, toc_t - int(80*ms))
+            q_s  = max(0, toc_t - int(20*ms));   q_e  = min(target_len-1, toc_t + int(160*ms))
+            t_s  = min(target_len-1, q_e);        t_e  = min(target_len-1, toc_t + int(400*ms))
+            if p_s < p_e: mask[p_s:p_e+1] = 1
+            if q_s < q_e: mask[q_s:q_e+1] = 2
+            if t_s < t_e: mask[t_s:t_e+1] = 3
+        return mask
+
+    for i, toc_native in enumerate(tocs_sorted):
+        if i not in valid_indices: continue
         toc_t = int(toc_native * fs / sample_rate)
         def proj(ms_val): return toc_t + int((ms_val - 500) * fs / 1000.0)
         
@@ -339,22 +384,29 @@ def build_continuous_mask_from_ann(beat_positions, sample_rate, global_ann, targ
             if s < e: mask[s:e+1] = 3
     return mask
 
-def stamp_median_mask(beat_positions, sample_rate, median_mask, target_len, anchor_ms=500):
+def stamp_median_mask(beat_positions, sample_rate, median_mask, target_len, anchor_ms=500, strip_sig=None, corr_threshold=0.0):
     mask = np.zeros(target_len, dtype=np.int64)
     segs = extract_intervals_multibeat(median_mask)
     
-    # Calcola anchor dal vero centro QRS nella maschera mediana predetta,
-    # invece di usare un valore fisso 500ms che puo' essere sfasato.
     qrs_segs = segs[2]  # class 2 = QRS
     if qrs_segs:
-        # Usa il centro del primo (unico) QRS nel battito medio
         q_on, q_off = qrs_segs[0]
         anchor_idx = (q_on + q_off) // 2
+        qrs_ms_on = q_on * 1000.0 / TARGET_FS
+        qrs_ms_off = q_off * 1000.0 / TARGET_FS
     else:
-        # Fallback al valore fisso
         anchor_idx = int(anchor_ms * TARGET_FS / 1000.0)
+        qrs_ms_on, qrs_ms_off = None, None
 
-    for toc_native in sorted(beat_positions):
+    tocs_sorted = sorted(beat_positions)
+    valid_indices = filter_beats_by_loo(
+        tocs_sorted, sample_rate, strip_sig, 
+        qrs_onset_offset=(qrs_ms_on, qrs_ms_off), 
+        corr_threshold=corr_threshold
+    )
+
+    for i, toc_native in enumerate(tocs_sorted):
+        if i not in valid_indices: continue
         toc_t = int(toc_native * TARGET_FS / sample_rate)
         for c in [1, 2, 3, 4]:
             for (on_idx, off_idx) in segs[c]:
@@ -757,6 +809,12 @@ def main():
     model_choices = ["Ensemble 2+5+6 (migliore per ST)", "Ensemble 2+5+2 (migliore per solo T)"] + [f"Solo {k}" for k in sorted(list(models_dict.keys()))]
     model_choice = st.sidebar.selectbox("Scelta Modello per Maschere", model_choices)
     
+    corr_threshold = st.sidebar.slider(
+        "Soglia Correlazione LOO Battiti (10s GE)",
+        min_value=0.0, max_value=1.0, value=0.7, step=0.05,
+        help="Soglia di correlazione Pearson col template LOO del tracciato per proiettare le maschere (GT e Pred) sui 10s. Imposta 0.0 per proiettare su tutti i battiti senza filtro."
+    )
+    
     with st.sidebar.expander("ℹ️ Info Modelli", expanded=False):
         st.markdown("""
 **Ensemble 2+5+6 — Segmentazione clinica (separa ST)**
@@ -1127,9 +1185,19 @@ Addestrata e testata in-domain sul tracciato 10s GE (nessuna distillazione, come
                         mask_med_pre = np.zeros(MEDIAN_LEN, dtype=np.int64)
                         mask_med_post = np.zeros(MEDIAN_LEN, dtype=np.int64)
                     
-                    pred_mask = stamp_median_mask(beat_pos, sample_rate, mask_med_pre, n_len)
-                    pred_post = stamp_median_mask(beat_pos, sample_rate, mask_med_post, n_len)
-                    gt_mask = build_continuous_mask_from_ann(beat_pos, sample_rate, global_ann_corrected, n_len)
+                    pred_mask = stamp_median_mask(beat_pos, sample_rate, mask_med_pre, n_len, strip_sig=cont_raw, corr_threshold=corr_threshold)
+                    pred_post = stamp_median_mask(beat_pos, sample_rate, mask_med_post, n_len, strip_sig=cont_raw, corr_threshold=corr_threshold)
+                    gt_mask = build_continuous_mask_from_ann(beat_pos, sample_rate, global_ann_corrected, n_len, matched=matched, strip_sig=cont_raw, corr_threshold=corr_threshold)
+                    
+                    if corr_threshold > 0.0 and beat_pos and len(beat_pos) >= 2:
+                        valid_idxs = filter_beats_by_loo(beat_pos, sample_rate, cont_raw, qrs_onset_offset=(global_ann_corrected.get('Q_Onset'), global_ann_corrected.get('Q_Offset')), corr_threshold=corr_threshold)
+                        n_used = len(valid_idxs)
+                        n_total = len(beat_pos)
+                        n_excl = n_total - n_used
+                        if n_excl > 0:
+                            col_main.caption(f"ℹ️ **Filtro Self-Template LOO (soglia {corr_threshold:.2f}):** {n_used}/{n_total} battiti inclusi ({n_excl} esclusi perché anomali/sotto soglia sul tracciato 10s).")
+                        else:
+                            col_main.caption(f"ℹ️ **Filtro Self-Template LOO (soglia {corr_threshold:.2f}):** tutti i {n_total}/{n_total} battiti sono risultati regolari e inclusi nella proiezione.")
                     
                     max_samples = min(n_len, 10000)
                     sig_plot = cont_raw[:max_samples]
